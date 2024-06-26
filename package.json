@@ -10,6 +10,7 @@
     "type": "git",
     "url": "git+https://github.com/maxmcd/mootex.git"
   },
+  "type": "module",
   "author": "",
   "license": "MIT",
   "bugs": {
