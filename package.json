@@ -1,0 +1,19 @@
+{
+  "name": "mootex",
+  "version": "0.0.1",
+  "description": "distributed locks for all",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maxmcd/mootex.git"
+  },
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/maxmcd/mootex/issues"
+  },
+  "homepage": "https://github.com/maxmcd/mootex#readme"
+}
