@@ -6,6 +6,7 @@ require (
 	go.etcd.io/etcd/client/pkg/v3 v3.5.14
 	go.etcd.io/etcd/client/v3 v3.5.14
 	go.etcd.io/etcd/server/v3 v3.5.14
+	golang.org/x/sync v0.5.0
 )
 
 require (

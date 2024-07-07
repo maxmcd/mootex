@@ -15,7 +15,7 @@ import (
 )
 
 type Client struct {
-	client     *clientv3.Client
+	C          *clientv3.Client
 	embedClose func()
 }
 
@@ -39,6 +39,7 @@ func NewClient(ctx context.Context, urls string) (c *Client, err error) {
 		cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 		cfg.Dir = filepath.Join(strings.TrimPrefix(urls, "file://"), "tailscale.etcd")
 		cfg.Logger = "zap" // set to avoid data race in the default logger
+		cfg.LogLevel = "fatal"
 
 		if strings.HasPrefix(cfg.Dir, os.TempDir()) {
 			// Well this is a pickle.
@@ -79,7 +80,7 @@ func NewClient(ctx context.Context, urls string) (c *Client, err error) {
 		eps = []string{"http://" + e.Clients[0].Addr().String()}
 	}
 
-	c.client, err = clientv3.New(clientv3.Config{Endpoints: eps})
+	c.C, err = clientv3.New(clientv3.Config{Endpoints: eps})
 	if err != nil {
 		return nil, fmt.Errorf("etcd.New: %v", err)
 	}

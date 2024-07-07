@@ -4,68 +4,125 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
+	"log/slog"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-func twoPhaseLocking(ctx context.Context, client1, client2 *clientv3.Client) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+var ErrMismatchedValue = errors.New("values are mismatched between clusters")
+var ErrInvalidUpdate = errors.New("initial key value does not match provided value")
 
-	// Define the keys and values to update
-	key1 := "key1"
-	value1 := "new_value1"
-	key2 := "key2"
-	value2 := "new_value2"
+func updateGlobalKey(ctx context.Context, clients []*clientv3.Client, key, oldValue, newValue string) error {
+	const lockTTLSeconds = 30
 
-	// Phase 1: Acquire Locks
-	txn1 := client1.Txn(ctx).If(clientv3.Compare(clientv3.CreateRevision(key1+"_lock"), "=", 0)).
-		Then(clientv3.OpPut(key1+"_lock", "locked"))
-	txn2 := client2.Txn(ctx).If(clientv3.Compare(clientv3.CreateRevision(key2+"_lock"), "=", 0)).
-		Then(clientv3.OpPut(key2+"_lock", "locked"))
-
-	// Execute transactions to acquire locks
-	resp1, err := txn1.Commit()
-	if err != nil {
-		return fmt.Errorf("failed to acquire lock on cluster1: %w", err)
-	}
-	if !resp1.Succeeded {
-		return errors.New("lock already held on cluster1")
-	}
-
-	resp2, err := txn2.Commit()
-	if err != nil {
-		// Release lock on cluster1 if cluster2 fails
-		client1.Delete(ctx, key1+"_lock")
-		return fmt.Errorf("failed to acquire lock on cluster2: %w", err)
-	}
-	if !resp2.Succeeded {
-		// Release lock on cluster1 if cluster2 fails
-		client1.Delete(ctx, key1+"_lock")
-		return errors.New("lock already held on cluster2")
+	// Acquire locks to change the specific key. Fetch the current value of the
+	// key so that we can restore if needed.
+	var txns []clientv3.Txn
+	var leases []clientv3.LeaseID
+	for _, client := range clients {
+		// Create a lease with TTL.
+		leaseResp, err := client.Grant(ctx, lockTTLSeconds)
+		if err != nil {
+			releaseLeases(clients, ctx, leases)
+			return fmt.Errorf("failed to create lease: %w", err)
+		}
+		leases = append(leases, leaseResp.ID)
+		txns = append(txns, client.Txn(ctx).If(
+			clientv3.Compare(clientv3.CreateRevision(key+"_lock"), "=", 0),
+		).
+			Then(
+				clientv3.OpGet(key),
+				clientv3.OpPut(key+"_lock", "locked", clientv3.WithLease(leaseResp.ID)),
+			),
+		)
 	}
 
-	// Phase 2: Update Values
-	txn1 = client1.Txn(ctx).Then(clientv3.OpPut(key1, value1), clientv3.OpDelete(key1+"_lock"))
-	txn2 = client2.Txn(ctx).Then(clientv3.OpPut(key2, value2), clientv3.OpDelete(key2+"_lock"))
+	// TODO: does this handle nil vs empty key correctly?
+	prevValues := make([][]byte, len(clients))
+	for i, txn := range txns {
+		releaseAcquiredLocks := func() {
+			for _, client := range clients[:i+1] {
+				if _, err := client.Delete(context.Background(), key+"_lock"); err != nil {
+					slog.Error("error deleting initial lock", "err", err)
+				}
+			}
+		}
+		resp, err := txn.Commit()
+		if err != nil {
+			err = fmt.Errorf("failed to acquire lock on cluster: %w", err)
+		}
+		if err == nil && !resp.Succeeded {
+			err = fmt.Errorf("lock already held on cluster")
+		}
+		if err != nil {
+			// Bailing, release all acquired locks.
+			releaseAcquiredLocks()
+			return err
+		}
+		rr := resp.Responses[0].GetResponseRange()
+		if rr.Count != 0 {
+			prevValues[i] = rr.Kvs[0].Value
+			if string(prevValues[i]) != oldValue {
+				// Bailing, release all acquired locks.
+				releaseAcquiredLocks()
+				return ErrInvalidUpdate
+			}
+			if i > 0 && string(prevValues[i]) != string(prevValues[i-1]) {
+				// Bailing, release all acquired locks.
+				releaseAcquiredLocks()
+				return ErrMismatchedValue
+			}
+		}
+	}
 
-	// Execute transactions to update values
-	resp1, err = txn1.Commit()
-	if err != nil {
-		return fmt.Errorf("failed to update value on cluster1: %w", err)
-	}
-	if !resp1.Succeeded {
-		return errors.New("failed to commit update on cluster1")
+	txns = nil
+	for _, client := range clients {
+		txns = append(txns, client.Txn(ctx).Then(clientv3.OpPut(key, newValue), clientv3.OpDelete(key+"_lock")))
 	}
 
-	resp2, err = txn2.Commit()
-	if err != nil {
-		return fmt.Errorf("failed to update value on cluster2: %w", err)
-	}
-	if !resp2.Succeeded {
-		return errors.New("failed to commit update on cluster2")
+	// If the initial value was nil then delete it, otherwise restore the
+	// previous value.
+	var rollbackOp clientv3.Op
+	if prevValues[0] == nil {
+		rollbackOp = clientv3.OpDelete(key)
+	} else {
+		rollbackOp = clientv3.OpPut(key, string(prevValues[0]))
 	}
 
+	for i, txn := range txns {
+		resp, err := txn.Commit()
+		if err != nil {
+			err = fmt.Errorf("failed to set value on cluster: %w", err)
+		}
+		if err == nil && !resp.Succeeded {
+			err = fmt.Errorf("failed to commit update on cluster")
+		}
+		if err != nil {
+			// Roll back all committed changes.
+			for _, client := range clients[:i] {
+				client.Txn(ctx).If(
+					clientv3.Compare(clientv3.Value(key), "=", newValue),
+				).Then(
+					rollbackOp,
+				).Commit()
+			}
+			// Release all locks still acquired
+			for _, client := range clients[i:] {
+				client.Delete(ctx, key+"_lock")
+			}
+			return err
+		}
+	}
 	return nil
+}
+
+func releaseLeases(clients []*clientv3.Client, ctx context.Context, leases []clientv3.LeaseID) {
+	for i, client := range clients {
+		if i < len(leases) {
+			_, err := client.Revoke(ctx, leases[i])
+			if err != nil {
+				slog.Warn(fmt.Sprintf("Failed to revoke lease: %v", err))
+			}
+		}
+	}
 }
